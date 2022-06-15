@@ -14,12 +14,13 @@ from keras.callbacks import History
 import matplotlib.pyplot as plt
 from subprocess import check_output
 from keras.optimizers.schedules import ExponentialDecay
+from sklearn.neighbors import kneighbors_graph
 import requests
 
 import os
 
 from spektral.layers.convolutional.gcn_conv import GCNConv
-
+from spektral.datasets import mnist
 
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
@@ -143,7 +144,7 @@ latent_dim = 2
 
 encoder_inputs = tf.keras.Input(shape=(6,6,1,))
 x = tf.keras.layers.Dropout(0)(encoder_inputs)
-x = GCNConv(16)(x)
+x = GCNConv(16)([x,np.ones((6,6))])
 x = tf.keras.layers.Conv2D(32, 2, activation = "relu", strides = 2, padding="same")(x)
 x = tf.keras.layers.Conv2D(64, 2, activation = "relu", strides = 1, padding="same")(x)
 x = tf.keras.layers.Flatten()(x)
