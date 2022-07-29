@@ -8,7 +8,7 @@ import tensorflow.keras.layers as kerlayers
 
 class GConvLayer(kerlayers.Layer):
     
-    def __init__(self, outdim, activation, **kwargs):
+    def __init__(self, outdim, activation=tf.keras.activations.relu, **kwargs):
         super().__init__(**kwargs)
         self.outdim = outdim
         self.activation = activation
@@ -28,6 +28,8 @@ class GConvLayer(kerlayers.Layer):
         az = az1 + z2
         digit = tf.nn.bias_add(az, self.b)
         return(self.activation(digit))
+    
+
 
         
 

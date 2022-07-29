@@ -17,6 +17,7 @@ from keras.optimizers.schedules import ExponentialDecay
 from sklearn.neighbors import kneighbors_graph
 import requests
 
+from GLayers import GConvLayer
 import os
 
 from spektral.layers.convolutional.gcn_conv import GCNConv
@@ -138,15 +139,25 @@ class Sampling(tf.keras.layers.Layer):
         dim = tf.shape(z_mean)[1]
         epsilon = tf.keras.backend.random_normal(shape=(batch,dim))
         return z_mean + tf.exp(0.5*z_log_var) * epsilon
-    
+
+#%%
+@tf.function
+def threeD_loss(inputs, outputs):
+    expand_inputs = tf.expand_dims(inputs, 2)
+    expand_outputs = tf.expand_dims(outputs, 1)
+    distances = tf.math.reduce_sum(tf.math.squared_difference(expand_inputs, expand_outputs), -1)
+    min_dist_to_inputs = tf.math.reduce_min(distances,1)
+    min_dist_to_outputs = tf.math.reduce_min(distances,2)
+    return tf.math.reduce_mean(min_dist_to_inputs, 1) + tf.math.reduce_mean(min_dist_to_outputs, 1)
 #%%
 latent_dim = 2
 
-encoder_inputs = tf.keras.Input(shape=(6,6,1,))
-x = tf.keras.layers.Dropout(0)(encoder_inputs)
-x = GCNConv(16)([x,np.ones((6,6))])
-x = tf.keras.layers.Conv2D(32, 2, activation = "relu", strides = 2, padding="same")(x)
-x = tf.keras.layers.Conv2D(64, 2, activation = "relu", strides = 1, padding="same")(x)
+encoder_inputs = tf.keras.Input(shape=(36,1),dtype=tf.float32)
+adjacency_input = tf.keras.Input(shape=(36,36),dtype=tf.float32)
+#x = tf.keras.layers.Dropout(0)(encoder_inputs)
+x = GConvLayer(outdim=16)(encoder_inputs,adjacency_input)
+#x = tf.keras.layers.Conv2D(32, 2, activation = "relu", strides = 2, padding="same")(x)
+#x = tf.keras.layers.Conv2D(64, 2, activation = "relu", strides = 1, padding="same")(x)
 x = tf.keras.layers.Flatten()(x)
 # x = tf.keras.layers.Dense(32, activation="relu")(encoder_inputs)
 # x = tf.keras.layers.Dense(64, activation="relu")(x)
@@ -156,24 +167,31 @@ x = tf.keras.layers.Dense(16, activation="relu")(x)
 z_mean = tf.keras.layers.Dense(latent_dim, name ="z_mean")(x)
 z_log_var = tf.keras.layers.Dense(latent_dim, name="z_log_var")(x)
 z = Sampling()([z_mean, z_log_var])
-encoder = tf.keras.Model(encoder_inputs, [z_mean, z_log_var, z], name ="encoder")
+
+encoder = tf.keras.Model(inputs=(encoder_inputs, adjacency_input), outputs=[z_mean, z_log_var, z], name ="encoder")
 encoder.summary()    
 
 #%%
 
 latent_inputs = tf.keras.Input(shape=(latent_dim,))
-x = tf.keras.layers.Dense(16, activation="relu")(x)
-x = tf.keras.layers.Dense(3*3*64, activation ="relu")(latent_inputs)
-x = tf.keras.layers.Reshape((3,3,64))(x)
-x = tf.keras.layers.Conv2DTranspose(64, 2, activation = "sigmoid", strides = 1, padding = "same")(x)
-x = tf.keras.layers.Conv2DTranspose(32, 2, activation = "sigmoid", strides = 2, padding = "same")(x)
-
+adjacency_input_dec  = tf.keras.Input(shape=(36,36),dtype=tf.float32)
+x = tf.keras.layers.Dense(16, activation="relu")(latent_inputs)
+#x = tf.keras.layers.Dense(3*3*64, activation ="relu")(latent_inputs)
+x = tf.keras.layers.Dense(32, activation="relu")(x)
+x = tf.keras.layers.Dense(576)(x)
+#x = tf.keras.layers.Reshape((3,3,64))(x)
+#x = tf.keras.layers.Conv2DTranspose(64, 2, activation = "sigmoid", strides = 1, padding = "same")(x)
+#x = tf.keras.layers.Conv2DTranspose(32, 2, activation = "sigmoid", strides = 2, padding = "same")(x)
+x = tf.keras.layers.Reshape((36,16), input_shape=(576,))(x)
+x = GConvLayer(outdim=16)(x,adjacency_input_dec)
 # x = tf.keras.layers.Dense(64, activation="sigmoid")(x)
 # x = tf.keras.layers.Dense(32, activation="sigmoid")(x)
-
+decoder_outputs = GConvLayer(outdim=1)(x,adjacency_input_dec)
 # decoder_outputs = tf.keras.layers.Dense(27,activation="sigmoid")(x)
-decoder_outputs = tf.keras.layers.Conv2DTranspose(1, 2, activation = "sigmoid", padding ="same")(x)
-decoder = tf.keras.Model(latent_inputs, decoder_outputs, name ="decoder")
+#x = tf.keras.layers.Conv2DTranspose(1, 2, activation = "sigmoid", padding ="same")(x)
+#x = tf.keras.layers.Flatten()(x)
+#decoder_outputs = tf.keras.layers.Dense(36)(x)
+decoder = tf.keras.Model(inputs=(latent_inputs,adjacency_input_dec), outputs=decoder_outputs, name ="decoder")
 decoder.summary()
 
 #%%
@@ -186,7 +204,8 @@ class VAE(tf.keras.Model):
         self.total_loss_tracker = tf.keras.metrics.Mean(name="total_loss")
         self.reconstruction_loss_tracker = tf.keras.metrics.Mean(name = "reconstruction_loss")
         self.kl_loss_tracker = tf.keras.metrics.Mean(name = "kl_loss")
-        
+        self.adj_matx = np.ones((36,36))
+        self.kl_warmup = tf.Variable(0.0, trainable=False, name='beta_kl_warmup', dtype=tf.float32)
 
     @property
     def metrics(self):
@@ -198,13 +217,13 @@ class VAE(tf.keras.Model):
     
     def train_step(self, data):
         with tf.GradientTape() as tape:
-            z_mean, z_log_var, z = self.encoder(data)
-            reconstruction = self.decoder(z)
-            reconstruction_loss = tf.reduce_mean(tf.reduce_sum(tf.keras.losses.binary_crossentropy(data, reconstruction), axis = (1, 2)))
-            kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-            kl_loss = tf.reduce_mean(tf.reduce_sum(kl_loss, axis = 1))
+            z_mean, z_log_var, z = self.encoder(inputs=(data,self.adj_matx))
+            reconstruction = self.decoder(inputs=(z,self.adj_matx))
+            reconstruction_loss =  tf.math.reduce_mean(threeD_loss(data,reconstruction))
+            kl_loss = (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
+            kl_loss = tf.reduce_mean(-0.5 * tf.reduce_sum(kl_loss, axis = -1))
             #beta = tf.Variable(1.)
-            total_loss = reconstruction_loss + kl_loss
+            total_loss = reconstruction_loss +kl_loss
         grads = tape.gradient(total_loss, self.trainable_weights)
         self.optimizer.apply_gradients(zip(grads,self.trainable_weights))
         self.total_loss_tracker.update_state(total_loss)
@@ -216,6 +235,12 @@ class VAE(tf.keras.Model):
             "kl_loss" : self.kl_loss_tracker.result()
             
             }
+    def call(self,inputs):
+        data,adj_mat = inputs
+        z, z_mean, z_log_var = self.encoder(inputs)
+        out = self.decoder(inputs=(z,adj_mat))
+        return out, z, z_mean, z_log_var
+        
         
 #%%
 
@@ -456,7 +481,7 @@ def preproc(test=False):
     
     X = scaler.transform(X)
 
-    X = X.reshape(X.shape[0],6,6,1)
+    X = X.reshape(X.shape[0],36,1)
 
     
 
@@ -477,14 +502,15 @@ def scaled_predict(vae,scaler,data):
     return repred
 
 #%%
-trainset,scaler = preproc()
-
+dataset,scaler = preproc()
+trainset, valset = train_test_split(dataset, test_size=0.2, random_state=seed)
+adj_matx = np.ones((36,36))
 #%%
 history = History()
 vae = VAE(encoder,decoder)
-learning_schedule = ExponentialDecay(0.001,decay_steps=10000,decay_rate=0.96,staircase=True)
+learning_schedule = ExponentialDecay(0.00001,decay_steps=1000,decay_rate=0.96,staircase=True)
 vae.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_schedule))
-vae.fit(trainset,epochs=500,batch_size=128,callbacks=[history])
+vae.fit(dataset,validation_split=0.2,epochs=50,batch_size=128,callbacks=[history])
 
 fig2,ax2 = plt.subplots()
 #ax2.plot(history.history['kl_loss'], label='kl_loss')
